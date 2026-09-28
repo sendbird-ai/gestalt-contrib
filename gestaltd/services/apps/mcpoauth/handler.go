@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/valon-technologies/gestalt/server/core"
@@ -17,6 +18,7 @@ const (
 	// resourceParam is the RFC 8707 resource indicator.
 	resourceParam = "resource"
 
+	clientAuthMethodNone  = "none"
 	clientAuthMethodPost  = "client_secret_post"
 	clientAuthMethodBasic = "client_secret_basic"
 )
@@ -93,6 +95,15 @@ func (h *Handler) ensure(ctx context.Context) (*oauth.UpstreamHandler, error) {
 	if resolved.clientSecret != "" && authMethod == oauth.ClientAuthNone {
 		authMethod = oauth.ClientAuthBody
 	}
+	// The reverse: with no secret there is nothing to authenticate with, so
+	// the client is public whatever the metadata advertised. That is the
+	// outcome of the public-client fallback in resolveRegistration, and a
+	// server that only accepts public clients rejects a request carrying a
+	// client_secret parameter, even an empty one in some cases
+	// ("Unsupported client authentication method" from mcp.vercel.com).
+	if resolved.clientSecret == "" {
+		authMethod = oauth.ClientAuthNone
+	}
 
 	resource := map[string]string{resourceParam: md.Resource}
 	return oauth.NewUpstream(oauth.UpstreamConfig{
@@ -160,7 +171,7 @@ func (h *Handler) resolveRegistration(ctx context.Context, md *DiscoveredMetadat
 		}
 	}
 
-	reg, err := RegisterClient(ctx, md.RegistrationEndpoint, h.cfg.RedirectURL, "Gestalt", md.PreferredAuthMethod())
+	reg, err := h.registerClient(ctx, md)
 	if err != nil {
 		return nil, fmt.Errorf("mcp oauth DCR for %s: %w", h.cfg.MCPURL, err)
 	}
@@ -187,6 +198,53 @@ func (h *Handler) resolveRegistration(ctx context.Context, md *DiscoveredMetadat
 		return nil, err
 	}
 	return reg, nil
+}
+
+// registerClient registers with the auth method the metadata prefers and, if
+// the server rejects that, retries once as a public client.
+//
+// The retry exists because discovery can hand back a document that does not
+// describe the server doing the registering. mcp.vercel.com is the case that
+// forced it: its RFC 9728 resource metadata names https://vercel.com as the
+// authorization server, whose RFC 8414 document advertises client_secret_post
+// and client_secret_basic but not none -- yet Vercel's MCP registration accepts
+// only public clients (its own mcp.vercel.com authorization server document
+// says [none]), and answers any other method with a misleading
+// invalid_redirect_uri. Following the spec chain exactly therefore registers
+// with a method the server will never accept.
+//
+// The retry is deliberately narrow:
+//   - Only a 400. That is the status RFC 7591 section 3.2.2 gives every
+//     client-metadata rejection. A 401/403 (registration needs an initial
+//     access token), a 429 or a 5xx says nothing about the auth method, and
+//     answering a throttled server with a second registration would be worse
+//     than failing.
+//   - Only when PKCE will be used. A public client has no secret, so PKCE is
+//     the only thing binding an authorization code to this gateway; without
+//     it, falling back would trade a failed connection for an interceptable
+//     one.
+//
+// The registration is the gateway's own rather than a user's, it is stored and
+// reused, so this costs one extra request once per upstream rather than per
+// call. A server that does not want public clients rejects the retry too, and
+// then the original error is the one reported.
+func (h *Handler) registerClient(ctx context.Context, md *DiscoveredMetadata) (*Registration, error) {
+	preferred := md.PreferredAuthMethod()
+	reg, err := RegisterClient(ctx, md.RegistrationEndpoint, h.cfg.RedirectURL, "Gestalt", preferred)
+	if err == nil || preferred == clientAuthMethodNone || !md.SupportsPKCE() {
+		return reg, err
+	}
+	var regErr *RegistrationError
+	if !errors.As(err, &regErr) || regErr.StatusCode != http.StatusBadRequest {
+		return nil, err
+	}
+	publicReg, publicErr := RegisterClient(ctx, md.RegistrationEndpoint, h.cfg.RedirectURL, "Gestalt", clientAuthMethodNone)
+	if publicErr != nil {
+		return nil, err
+	}
+	slog.WarnContext(ctx, "mcp oauth DCR rejected the advertised auth method; registered as a public client instead",
+		"mcp_url", h.cfg.MCPURL, "rejected_method", preferred, "status", regErr.StatusCode)
+	return publicReg, nil
 }
 
 func (h *Handler) storedRegistration(ctx context.Context, md *DiscoveredMetadata) (string, *Registration, error) {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -375,4 +376,167 @@ func TestMCPOAuthFlow(t *testing.T) {
 			}
 		}
 	})
+}
+
+// newPublicOnlyAuthServer models mcp.vercel.com: the authorization server the
+// RFC 9728 chain leads to advertises only confidential methods, but
+// registration accepts nothing except a public client. It answers any other
+// method with invalid_redirect_uri, which is what Vercel actually returns. Its
+// token endpoint rejects a request that carries a client_secret at all.
+// registerStatus, when set, overrides the rejection status for confidential
+// registrations, and noPKCE advertises no S256, so the no-retry paths can be
+// exercised.
+type publicOnlyAuthServer struct {
+	srv            *httptest.Server
+	mu             sync.Mutex
+	dcrMethods     []string
+	tokenHadSecret []bool
+	registerStatus int
+	noPKCE         bool
+}
+
+func (as *publicOnlyAuthServer) challengeMethods() []string {
+	if as.noPKCE {
+		return []string{"plain"}
+	}
+	return []string{"S256"}
+}
+
+func newPublicOnlyAuthServer(t *testing.T) *publicOnlyAuthServer {
+	t.Helper()
+	as := &publicOnlyAuthServer{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /mcp", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+as.srv.URL+`/.well-known/oauth-protected-resource"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	})
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"resource":              as.srv.URL + "/mcp",
+			"authorization_servers": []string{as.srv.URL + "/as"},
+		})
+	})
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server/as", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"issuer":                                as.srv.URL + "/as",
+			"authorization_endpoint":                as.srv.URL + "/as/authorize",
+			"token_endpoint":                        as.srv.URL + "/as/token",
+			"registration_endpoint":                 as.srv.URL + "/as/register",
+			"code_challenge_methods_supported":      as.challengeMethods(),
+			"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post"},
+		})
+	})
+	mux.HandleFunc("POST /as/register", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Method string `json:"token_endpoint_auth_method"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		as.mu.Lock()
+		as.dcrMethods = append(as.dcrMethods, body.Method)
+		status := as.registerStatus
+		as.mu.Unlock()
+		if body.Method != "none" {
+			if status == 0 {
+				status = http.StatusBadRequest
+			}
+			writeJSON(w, status, map[string]any{"error": "invalid_redirect_uri"})
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"client_id": "public-001", "token_endpoint_auth_method": "none"})
+	})
+	mux.HandleFunc("POST /as/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		_, hadSecret := r.PostForm["client_secret"]
+		as.mu.Lock()
+		as.tokenHadSecret = append(as.tokenHadSecret, hadSecret)
+		as.mu.Unlock()
+		if hadSecret {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid_client", "error_description": "Unsupported client authentication method."})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"access_token": "access-public", "token_type": "Bearer", "refresh_token": "refresh-public", "expires_in": 3600})
+	})
+	as.srv = httptest.NewServer(mux)
+	testutil.CloseOnCleanup(t, as.srv)
+	return as
+}
+
+func TestRegistrationFallsBackToPublicClient(t *testing.T) {
+	t.Parallel()
+
+	as := newPublicOnlyAuthServer(t)
+	handler := mcpoauth.NewHandler(mcpoauth.HandlerConfig{
+		MCPURL:      as.srv.URL + "/mcp",
+		Credentials: coretesting.NewStubExternalCredentialProvider(),
+		RedirectURL: testRedirectURL,
+	})
+
+	authURL, verifier := handler.StartOAuth("state", nil)
+	if got := clientIDOf(t, authURL); got != "public-001" {
+		t.Fatalf("client_id = %q, want public-001 from the public-client retry (auth URL %q)", got, authURL)
+	}
+	if want := []string{"client_secret_post", "none"}; !slices.Equal(as.dcrMethods, want) {
+		t.Errorf("DCR methods = %v, want %v: the advertised method first, then one public retry", as.dcrMethods, want)
+	}
+
+	tokenResp, err := handler.ExchangeCodeWithVerifier(context.Background(), "code", verifier)
+	if err != nil {
+		t.Fatalf("ExchangeCodeWithVerifier: %v", err)
+	}
+	if tokenResp.AccessToken != "access-public" {
+		t.Errorf("access_token = %q, want access-public", tokenResp.AccessToken)
+	}
+	// A secretless client must not send client_secret, even empty, however
+	// the metadata advertised: that is the request this server rejects.
+	if len(as.tokenHadSecret) != 1 || as.tokenHadSecret[0] {
+		t.Errorf("token exchange carried client_secret = %v, want [false]", as.tokenHadSecret)
+	}
+}
+
+func TestRegistrationRetriesOnlyMetadataRejections(t *testing.T) {
+	t.Parallel()
+
+	// Only a 400 is a statement about client metadata (RFC 7591 3.2.2). A
+	// token-gated registration, a throttled one or a server fault must not be
+	// answered with a second registration under a different auth method.
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
+			as := newPublicOnlyAuthServer(t)
+			as.registerStatus = status
+			handler := mcpoauth.NewHandler(mcpoauth.HandlerConfig{
+				MCPURL:      as.srv.URL + "/mcp",
+				Credentials: coretesting.NewStubExternalCredentialProvider(),
+				RedirectURL: testRedirectURL,
+			})
+
+			if authURL, _ := handler.StartOAuth("state", nil); authURL != "" {
+				t.Fatalf("StartOAuth = %q, want failure on a %d registration", authURL, status)
+			}
+			if want := []string{"client_secret_post"}; !slices.Equal(as.dcrMethods, want) {
+				t.Errorf("DCR methods = %v, want %v (no retry on %d)", as.dcrMethods, want, status)
+			}
+		})
+	}
+}
+
+func TestRegistrationDoesNotFallBackWithoutPKCE(t *testing.T) {
+	t.Parallel()
+
+	// A public client without PKCE has nothing binding the code to the
+	// gateway, so a server that advertises no S256 does not get one.
+	as := newPublicOnlyAuthServer(t)
+	as.noPKCE = true
+	handler := mcpoauth.NewHandler(mcpoauth.HandlerConfig{
+		MCPURL:      as.srv.URL + "/mcp",
+		Credentials: coretesting.NewStubExternalCredentialProvider(),
+		RedirectURL: testRedirectURL,
+	})
+
+	if authURL, _ := handler.StartOAuth("state", nil); authURL != "" {
+		t.Fatalf("StartOAuth = %q, want failure: no public fallback without PKCE", authURL)
+	}
+	if want := []string{"client_secret_post"}; !slices.Equal(as.dcrMethods, want) {
+		t.Errorf("DCR methods = %v, want %v", as.dcrMethods, want)
+	}
 }

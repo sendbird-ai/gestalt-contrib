@@ -23,6 +23,19 @@ func (r *Registration) Expired() bool {
 	return false
 }
 
+// RegistrationError is a DCR request the authorization server answered with a
+// non-success status. The message is unchanged from before it was typed, so
+// logs and the errors callers surface read the same.
+type RegistrationError struct {
+	Endpoint   string
+	StatusCode int
+	Body       []byte
+}
+
+func (e *RegistrationError) Error() string {
+	return fmt.Sprintf("DCR endpoint %s returned %d: %s", e.Endpoint, e.StatusCode, e.Body)
+}
+
 func RegisterClient(ctx context.Context, endpoint, redirectURI, clientName, tokenAuthMethod string) (*Registration, error) {
 	if tokenAuthMethod == "" {
 		tokenAuthMethod = "none"
@@ -60,7 +73,7 @@ func RegisterClient(ctx context.Context, endpoint, redirectURI, clientName, toke
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("DCR endpoint %s returned %d: %s", endpoint, resp.StatusCode, respBody)
+		return nil, &RegistrationError{Endpoint: endpoint, StatusCode: resp.StatusCode, Body: respBody}
 	}
 
 	var result map[string]any

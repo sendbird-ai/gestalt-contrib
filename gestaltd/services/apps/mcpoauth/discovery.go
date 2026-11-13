@@ -95,6 +95,10 @@ func probeForResourceMetadata(ctx context.Context, client *http.Client, mcpURL s
 		return "", fmt.Errorf("creating probe request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Streamable HTTP requires the client to accept both. Without it a server
+	// may answer 406 instead of 401, so the WWW-Authenticate hint is never seen
+	// and discovery has only the well-known fallback below to go on.
+	req.Header.Set("Accept", "application/json, text/event-stream")
 
 	resp, err := client.Do(req)
 	if err != nil {

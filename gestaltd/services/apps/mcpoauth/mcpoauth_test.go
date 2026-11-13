@@ -376,3 +376,42 @@ func TestMCPOAuthFlow(t *testing.T) {
 		}
 	})
 }
+
+func TestDiscoverProbeAcceptsStreamableHTTP(t *testing.T) {
+	t.Parallel()
+
+	// A Streamable HTTP server may answer 406 to a POST that does not accept
+	// both JSON and SSE, and then never sends the WWW-Authenticate hint. Here
+	// the hint is the only route to the metadata: the resource metadata sits at
+	// a non-standard path, so the well-known fallback does not find it.
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/mcp":
+			accept := r.Header.Get("Accept")
+			if !strings.Contains(accept, "application/json") || !strings.Contains(accept, "text/event-stream") {
+				w.WriteHeader(http.StatusNotAcceptable)
+				return
+			}
+			w.Header().Set("WWW-Authenticate", `Bearer resource_metadata="`+srv.URL+`/custom-prm"`)
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/custom-prm":
+			_, _ = fmt.Fprintf(w, `{"resource":%q,"authorization_servers":[%q]}`, srv.URL+"/mcp", srv.URL+"/as")
+		case "/.well-known/oauth-authorization-server/as":
+			_, _ = fmt.Fprintf(w, `{"issuer":%q,"authorization_endpoint":%q,"token_endpoint":%q,"registration_endpoint":%q}`,
+				srv.URL+"/as", srv.URL+"/as/authorize", srv.URL+"/as/token", srv.URL+"/as/register")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	testutil.CloseOnCleanup(t, srv)
+
+	md, err := mcpoauth.Discover(context.Background(), srv.URL+"/mcp")
+	if err != nil {
+		t.Fatalf("Discover: %v", err)
+	}
+	if got, want := md.AuthServerURL, srv.URL+"/as"; got != want {
+		t.Errorf("AuthServerURL = %q, want %q via the WWW-Authenticate hint", got, want)
+	}
+}

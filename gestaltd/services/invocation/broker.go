@@ -1615,6 +1615,19 @@ func (b *Broker) ResolveRuntimeConnectionCredential(ctx context.Context, p *prin
 	}
 }
 
+// noCredentialError reports a missing credential, and says why when the
+// connection could not have been made in the first place. Without the second
+// half, an upstream whose dynamic registration rejects the gateway looks
+// exactly like one the caller simply has not connected yet -- the caller
+// cannot connect it, so it never gets a credential, so every lookup reads as
+// "not connected" and the outage is invisible to everyone.
+func noCredentialError(detail string, authConfigErr error) error {
+	if authConfigErr != nil {
+		return fmt.Errorf("%w: %s, and connecting it is failing: %w: %w", ErrNoCredential, detail, ErrConnectionUnavailable, authConfigErr)
+	}
+	return fmt.Errorf("%w: %s", ErrNoCredential, detail)
+}
+
 func (b *Broker) resolveSubjectCredential(ctx context.Context, prov core.Provider, subjectID, providerName, connection, instance string, credentialMode core.ConnectionMode, credentialSubjectID string) (context.Context, string, error) {
 	ctx, credential, err := b.resolveSubjectRuntimeCredential(ctx, prov, subjectID, providerName, connection, instance, credentialMode, credentialSubjectID)
 	return ctx, credential.Token, err
@@ -1650,12 +1663,14 @@ func (b *Broker) resolveSubjectRuntimeCredential(ctx context.Context, prov core.
 	}
 
 	authConfig := runtimeInfo.AuthConfig
+	var authConfigErr error
 	if runtimeInfo.AuthConfigResolver != nil {
 		resolved, resolverErr := runtimeInfo.AuthConfigResolver(ctx)
 		if resolverErr != nil {
 			// Serve the stored credential without refresh capability rather
 			// than failing the invocation on a discovery outage.
 			b.log().WarnContext(ctx, "resolving connection auth config", "provider", providerName, "connection", connection, "error", resolverErr)
+			authConfigErr = resolverErr
 		} else {
 			authConfig = resolved
 		}
@@ -1675,9 +1690,9 @@ func (b *Broker) resolveSubjectRuntimeCredential(ctx context.Context, prov core.
 		switch {
 		case errors.Is(err, core.ErrNotFound):
 			if instance != "" {
-				return ctx, ConnectionRuntimeCredential{}, fmt.Errorf("%w: no external credential stored for integration %q instance %q", ErrNoCredential, providerName, instance)
+				return ctx, ConnectionRuntimeCredential{}, noCredentialError(fmt.Sprintf("no external credential stored for integration %q instance %q", providerName, instance), authConfigErr)
 			}
-			return ctx, ConnectionRuntimeCredential{}, fmt.Errorf("%w: no external credential stored for integration %q", ErrNoCredential, providerName)
+			return ctx, ConnectionRuntimeCredential{}, noCredentialError(fmt.Sprintf("no external credential stored for integration %q", providerName), authConfigErr)
 		case errors.Is(err, core.ErrAmbiguousCredential):
 			return ctx, ConnectionRuntimeCredential{}, fmt.Errorf("%w: integration %q has multiple connections; specify which instance to use with the %q parameter",
 				ErrAmbiguousInstance, providerName, "_instance")
@@ -1692,7 +1707,7 @@ func (b *Broker) resolveSubjectRuntimeCredential(ctx context.Context, prov core.
 	}
 	storedCredential := resp.Credential
 	if storedCredential == nil {
-		return ctx, ConnectionRuntimeCredential{}, fmt.Errorf("%w: no external credential stored for integration %q", ErrNoCredential, providerName)
+		return ctx, ConnectionRuntimeCredential{}, noCredentialError(fmt.Sprintf("no external credential stored for integration %q", providerName), authConfigErr)
 	}
 	SetCredentialAudit(ctx, credentialMode, credentialSubjectID, credentialConnection, storedCredential.Qualifier)
 	ctx = WithCredentialContext(ctx, CredentialContext{

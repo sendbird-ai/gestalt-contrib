@@ -15,4 +15,11 @@ var (
 	ErrScopeDenied          = errors.New("token scope denied")
 	ErrInvalidInvocation    = errors.New("invalid invocation")
 	ErrStreamingUnsupported = errors.New("streaming not supported")
+	// ErrConnectionUnavailable marks a connection nobody can currently make:
+	// the gateway could not resolve its own OAuth client for the upstream
+	// (discovery or dynamic registration failed). It travels alongside
+	// ErrNoCredential rather than replacing it, so callers that only ask "is
+	// this user connected?" keep working, while callers that need to tell "not
+	// connected yet" from "cannot be connected" can.
+	ErrConnectionUnavailable = errors.New("integration connection unavailable")
 )

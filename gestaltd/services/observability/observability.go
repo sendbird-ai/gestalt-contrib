@@ -33,6 +33,7 @@ var (
 	AttrCredentialProvider            = attribute.Key("gestalt.credential.provider")
 	AttrCredentialOperation           = attribute.Key("gestalt.credential.operation")
 	AttrCatalogSource                 = attribute.Key("gestalt.catalog.source")
+	AttrUpstreamOutcome               = attribute.Key("gestalt.upstream.outcome")
 	AttrInvocationSurface             = attribute.Key("gestaltd.invocation.surface")
 	AttrInvokeAuthorizationDecision   = attribute.Key("gestaltd.invoke.authorization.decision")
 	AttrInvokeAuthorizationDenyReason = attribute.Key("gestaltd.invoke.authorization.deny_reason")
@@ -67,6 +68,7 @@ var (
 	agentToolResolveMetrics             metricutil.MeterCache[metricSet]
 	genAIClientOperationDurationMetrics metricutil.MeterCache[metric.Float64Histogram]
 	catalogOperationResolveMetrics      metricutil.MeterCache[metricSet]
+	upstreamCatalogResolveMetrics       metricutil.MeterCache[metricSet]
 	credentialProviderOperationMetrics  metricutil.MeterCache[metricSet]
 	invokeAuthorizationMetrics          metricutil.MeterCache[metricSet]
 	appAdminUIMetrics                   metricutil.MeterCache[metricSet]
@@ -195,6 +197,15 @@ func RecordGenAIClientOperationDuration(ctx context.Context, startedAt time.Time
 
 func RecordCatalogOperationResolve(ctx context.Context, startedAt time.Time, failed bool, attrs ...attribute.KeyValue) {
 	record(ctx, &catalogOperationResolveMetrics, "gestaltd.catalog.operation.resolve", "gestaltd catalog operation resolution", startedAt, failed, attrs...)
+}
+
+// RecordUpstreamCatalogResolve counts live catalog fetches from an app's
+// upstream, one per gestalt_search that names the app. failed is true only for
+// an upstream fault -- a caller who has simply not connected the app is not a
+// failure -- so the error count is the health signal: nonzero for a provider
+// means its upstream is broken for whoever is trying to use it.
+func RecordUpstreamCatalogResolve(ctx context.Context, startedAt time.Time, failed bool, attrs ...attribute.KeyValue) {
+	record(ctx, &upstreamCatalogResolveMetrics, "gestaltd.upstream.catalog.resolve", "gestaltd live catalog fetches from app upstreams", startedAt, failed, attrs...)
 }
 
 func RecordCredentialProviderOperation(ctx context.Context, startedAt time.Time, failed bool, attrs ...attribute.KeyValue) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,8 +15,10 @@ import (
 	"github.com/valon-technologies/gestalt/server/core/catalog"
 	"github.com/valon-technologies/gestalt/server/services/identity/principal"
 	"github.com/valon-technologies/gestalt/server/services/invocation"
+	"github.com/valon-technologies/gestalt/server/services/observability"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Workspace MCP handshake tools. Hosts such as Muxy and Cursor require
@@ -280,11 +283,63 @@ func (h *StatelessHTTPHandler) catalogForSearch(ctx context.Context, provName st
 	}
 	liveCtx, cancel := context.WithTimeout(ctx, liveSearchTimeout)
 	defer cancel()
+	startedAt := time.Now()
 	raw, err := h.resolveCatalog(liveCtx, provName, prov, instance, true)
+	outcome := searchUpstreamOutcome(ctx, prov, err)
+	observability.RecordUpstreamCatalogResolve(ctx, startedAt, outcome == upstreamOutcomeUnavailable,
+		attribute.String("gestalt.provider", provName),
+		observability.AttrUpstreamOutcome.String(outcome),
+	)
 	if err != nil {
+		if outcome == upstreamOutcomeUnavailable {
+			slog.WarnContext(ctx, "mcp search upstream unavailable", "provider", provName, "error", err)
+		}
 		return nil, err
 	}
 	return projectCatalog(h.cfg, provName, prov, raw), nil
+}
+
+// Values of observability.AttrUpstreamOutcome for a live catalog fetch.
+const (
+	upstreamOutcomeOK = "ok"
+	// The caller has no credential for the app and could get one by
+	// connecting it. Routine, not an upstream fault.
+	upstreamOutcomeNotConnected = "not_connected"
+	// The caller's own credential was rejected. They can act on it by
+	// reconnecting, and one person's revoked grant is not an outage, so it is
+	// not counted as an upstream fault either.
+	upstreamOutcomeReconnectRequired = "reconnect_required"
+	// The upstream is broken for everyone trying to use it. This is the
+	// outcome the metric's error count tracks.
+	upstreamOutcomeUnavailable = "unavailable"
+	// The caller went away mid-search; says nothing about the upstream.
+	upstreamOutcomeCanceled = "canceled"
+)
+
+func searchUpstreamOutcome(ctx context.Context, prov core.Provider, err error) string {
+	switch {
+	case err == nil:
+		return upstreamOutcomeOK
+	case ctx.Err() != nil:
+		return upstreamOutcomeCanceled
+	// Checked before ErrNoCredential, which it travels with: the caller has
+	// no credential because nobody can currently get one.
+	case errors.Is(err, invocation.ErrConnectionUnavailable):
+		return upstreamOutcomeUnavailable
+	case errors.Is(err, invocation.ErrNoCredential):
+		return upstreamOutcomeNotConnected
+	case errors.Is(err, invocation.ErrReconnectRequired) || errors.Is(err, core.ErrReconnectRequired):
+		// ClassifySessionCatalogError turns any upstream 401/403 into
+		// "reconnect required". For an app that takes no credential there is
+		// nothing to reconnect: the upstream is refusing the gateway itself,
+		// as a deployment-protection wall does.
+		if prov != nil && prov.ConnectionMode() == core.ConnectionModeNone {
+			return upstreamOutcomeUnavailable
+		}
+		return upstreamOutcomeReconnectRequired
+	default:
+		return upstreamOutcomeUnavailable
+	}
 }
 
 func (h *StatelessHTTPHandler) callDescribe(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {

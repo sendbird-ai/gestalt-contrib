@@ -224,6 +224,24 @@ still honor each event's `visibility`.
 | `GET` | `/metrics` | Prometheus scrape endpoint for emitted metrics. Requires Gestalt authentication only when served on the public listener. The recommended production pattern is to move it to `server.management` and protect that listener at the network or proxy layer. |
 | `GET` | `/admin/api/v1/runtime/providers` | List configured runtime providers. When support inspection succeeds, loaded providers include a derived `profile` with `advertised` behavior reported by the runtime and `effective` behavior resolved for this host deployment. `error` explains any current inspection failure. |
 | `GET` | `/admin/api/v1/runtime/providers/{provider}/sessions` | List active sessions for one runtime provider, including session `id`, lifecycle `state`, and the hosted `app` when known. Supports `pageSize` and `pageToken`, and returns `sessions` plus `nextPageToken` when more sessions are available. |
+| `POST` | `/admin/api/v1/apps/{app}/connections/{connection}/oauth-registration/reset` | Delete the stored dynamic client registration for an `mcp_oauth` connection, so the next connect registers a new client. Use it when the authorization server has forgotten or revoked the client. Users connected with the old client must reconnect. See below for when it refuses. |
+
+The registration reset answers `400` for a connection with a configured
+`client_id` or one that does not use dynamic client registration. A
+registration is stored per authorization server and callback URL, so
+connections whose MCP servers share an authorization server share one. The
+reset answers `409` and deletes nothing when:
+
+- `registration_shared`: other connections share the registration. They are
+  listed in `sharedWith`. Retry with `?include_shared=true` to reset it for all
+  of them.
+- `registration_sharing_unknown`: some connections, listed in `unresolved`,
+  could not be checked because discovery failed or the app failed to load.
+  Retry with `?skip_unresolved=true` after checking them.
+- `registration_unavailable`: the authorization server no longer advertises a
+  registration endpoint, so no new client could be registered.
+- `registration_changed`: the upstream moved to a different authorization
+  server during the reset. Retry.
 
 ## MCP
 

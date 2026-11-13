@@ -211,6 +211,7 @@ func (s *Server) mountAdminAPIRoutes(r chi.Router) {
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.Timeout(10 * time.Minute))
 			s.mountAdminAppInstallWriteRoutes(r)
+			s.mountAdminOAuthRegistrationRoutes(r)
 		})
 	})
 }

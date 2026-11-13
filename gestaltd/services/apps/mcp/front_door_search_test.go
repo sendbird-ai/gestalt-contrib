@@ -1,6 +1,9 @@
 package mcp
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 // Fields as callSearch builds them: the operation's own text weighted above
 // the app's, so an app-name match cannot outrank a direct operation match.
@@ -274,5 +277,41 @@ func TestSearchDottedIdentifierStaysOneTerm(t *testing.T) {
 	trimmed := searchTerms("(items.list),")
 	if len(trimmed) != 1 || trimmed[0] != "items.list" {
 		t.Errorf("surrounding punctuation should still be trimmed, got %v", trimmed)
+	}
+}
+
+// Verbs look like stop words in ordinary prose but are among the most
+// informative terms in a tool catalog: "get" is what separates get_tokens from
+// list_tokens. Stripping them would trade the filler defect for a worse one.
+func TestSearchTermsKeepsDomainVerbs(t *testing.T) {
+	for _, verb := range []string{
+		"get", "list", "create", "send", "read", "write", "find", "search",
+		"delete", "update", "add", "remove", "query", "fetch", "resolve", "ask",
+	} {
+		got := searchTerms(verb + " something")
+		if len(got) == 0 || got[0] != verb {
+			t.Errorf("searchTerms(%q ...) dropped the verb; got %v", verb, got)
+		}
+	}
+}
+
+// Function words are removed so a long description cannot win by harvesting
+// them. See searchStopWords.
+func TestSearchTermsDropsFunctionWords(t *testing.T) {
+	got := searchTerms("can you find me the design tokens")
+	want := []string{"find", "design", "tokens"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("searchTerms = %v, want %v", got, want)
+	}
+}
+
+// A query made entirely of function words still has to search for something.
+// Returning nothing would turn a real question into an empty page, which reads
+// to an agent as "not connected" -- the original reported defect.
+func TestSearchTermsFallsBackWhenAllTermsAreStopWords(t *testing.T) {
+	for _, q := range []string{"the", "is it", "can you"} {
+		if got := searchTerms(q); len(got) == 0 {
+			t.Errorf("searchTerms(%q) returned nothing; expected a fallback to the original terms", q)
+		}
 	}
 }

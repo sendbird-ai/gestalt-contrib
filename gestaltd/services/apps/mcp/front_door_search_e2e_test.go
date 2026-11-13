@@ -205,3 +205,43 @@ func TestSearchE2ENoCrossAppFlood(t *testing.T) {
 		t.Errorf("first result = %q, want slack_send_message; page %v", ops[0], ops)
 	}
 }
+
+// A long description containing common English words used to outrank the
+// operation the query described, because every matched term earns a bonus
+// however little it narrows the search. Adding filler to a query must not
+// change its top hit.
+func TestSearchE2EFillerWordsDoNotChangeTheTopHit(t *testing.T) {
+	t.Parallel()
+
+	design := &coretesting.StubIntegration{
+		N: "design", DN: "Design", ConnMode: core.ConnectionModeNone,
+		CatalogVal: &catalog.Catalog{Name: "design", Operations: []catalog.CatalogOperation{
+			{ID: "get_tokens", Title: "Get Tokens", Description: "Color, spacing and type values for a design system"},
+		}},
+	}
+	docs := &coretesting.StubIntegration{
+		N: "docs", DN: "Docs", ConnMode: core.ConnectionModeNone,
+		CatalogVal: &catalog.Catalog{Name: "docs", Operations: []catalog.CatalogOperation{
+			{ID: "resolve_library_id", Title: "Resolve Library ID", Description: "Resolves a package name to a library ID. " +
+				"You must call this before fetching docs. If you can find the library, return it to me with the best match; " +
+				"if the name is ambiguous, ask which one they mean."},
+		}},
+	}
+	cfg := Config{
+		Invoker:          &listingInvoker{stub: design},
+		Providers:        testutil.NewProviderRegistry(t, design, docs),
+		AllowedProviders: []string{"design", "docs"},
+		IncludeREST:      map[string]bool{"design": true, "docs": true},
+	}
+
+	for _, query := range []string{"design tokens", "can you find me the design tokens"} {
+		body := callSearch(t, cfg, listingTestPrincipal(), map[string]any{"query": query})
+		if len(body.Results) == 0 {
+			t.Errorf("query %q returned nothing", query)
+			continue
+		}
+		if got := body.Results[0].Operation; got != "get_tokens" {
+			t.Errorf("query %q: first result = %q, want get_tokens; page %v", query, got, body.Results)
+		}
+	}
+}

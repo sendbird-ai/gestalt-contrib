@@ -458,6 +458,7 @@ const (
 func searchTerms(query string) []string {
 	fields := strings.Fields(strings.ToLower(query))
 	terms := make([]string, 0, len(fields))
+	dropped := make([]string, 0, len(fields))
 	seen := make(map[string]struct{}, len(fields))
 	for _, f := range fields {
 		f = strings.TrimFunc(f, func(r rune) bool { return !isSearchWordRune(r) })
@@ -468,9 +469,51 @@ func searchTerms(query string) []string {
 			continue
 		}
 		seen[f] = struct{}{}
+		if _, stop := searchStopWords[f]; stop {
+			dropped = append(dropped, f)
+			continue
+		}
 		terms = append(terms, f)
 	}
+	// A query made entirely of function words still has to search for
+	// something. Falling back to the original terms keeps "the" answerable
+	// rather than turning a real question into an empty page.
+	if len(terms) == 0 {
+		return dropped
+	}
 	return terms
+}
+
+// searchStopWords are function words removed from a query before scoring.
+//
+// Every matched term earns a fixed bonus regardless of how much it narrows the
+// search, so a long description wins by harvesting common English words. For
+// "can you find me the design tokens", an unrelated operation whose
+// 2,000-character description happens to contain "can", "you", "me" and "the"
+// outranked a short get_tokens operation that matched "design" and "tokens",
+// purely on filler.
+//
+// This list is deliberately function words ONLY. Verbs like get, list, create,
+// send, read, find and search look like stop words in ordinary prose but are
+// among the most informative terms in a tool catalog: they are what separates
+// get_tokens from list_tokens. Removing them would trade this defect for a
+// worse one.
+var searchStopWords = map[string]struct{}{
+	// articles and determiners
+	"a": {}, "an": {}, "the": {}, "this": {}, "that": {}, "these": {}, "those": {},
+	// pronouns
+	"i": {}, "me": {}, "my": {}, "mine": {}, "we": {}, "us": {}, "our": {}, "ours": {},
+	"you": {}, "your": {}, "yours": {}, "it": {}, "its": {}, "they": {}, "them": {}, "their": {},
+	// auxiliaries and copulas
+	"am": {}, "is": {}, "are": {}, "was": {}, "were": {}, "be": {}, "been": {}, "being": {},
+	"can": {}, "could": {}, "will": {}, "would": {}, "shall": {}, "should": {},
+	"may": {}, "might": {}, "must": {}, "does": {}, "did": {}, "done": {},
+	"have": {}, "has": {}, "had": {},
+	// prepositions and conjunctions
+	"of": {}, "to": {}, "in": {}, "on": {}, "at": {}, "by": {}, "with": {}, "from": {},
+	"and": {}, "or": {}, "but": {}, "if": {}, "then": {}, "than": {}, "as": {}, "so": {},
+	// politeness and filler
+	"please": {}, "kindly": {}, "just": {}, "some": {}, "there": {}, "here": {},
 }
 
 // identifierWords inserts a separator at camelCase and letter/digit
